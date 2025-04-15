@@ -1,0 +1,118 @@
+image: python:3.9 # Base image for most steps
+
+pipelines:
+  # CI Pipeline: Runs on pushes to feature branches or Pull Requests to develop/main
+  branches:
+    'feature/*': # Or use pull-requests section
+      - step: &ci-checks
+          name: Lint and Unit Test
+          caches:
+            - pip
+          script:
+            - pip install -r requirements-dev.txt # flake8, pytest, pyspark, sklearn, etc.
+            - echo "Running Linter..."
+            - flake8 scripts/ tests/
+            - echo "Running Unit Tests..."
+            - pytest tests/unit/ # Assuming unit tests are here
+          artifacts:
+            - tests/** # Keep test reports if needed
+
+      - step: &build-push-container
+          name: Build and Push Training Container
+          services:
+            - docker # Enable Docker service
+          caches:
+            - docker
+          script:
+            # Environment variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME must be configured in Bitbucket Repository variables
+            - echo "Building Docker image..."
+            - > # Multiline script command
+              docker build -t $ECR_REPOSITORY_NAME:$BITBUCKET_COMMIT scripts/train/ \
+              --build-arg YOUR_BUILD_ARGS_IF_ANY # Pass build args if needed
+            - echo "Logging into AWS ECR..."
+            # Use AWS Pipe for ECR login (recommended) or aws cli
+            - pipe: amazon/aws-ecr-push-image:1.6.1
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $ECR_REPOSITORY_NAME
+                TAGS: $BITBUCKET_COMMIT latest # Push commit hash and latest tags
+                # EXTRA_ARGS: "--debug" # Optional
+
+      - step: &validate-infra
+          name: Validate Infrastructure Code
+          image: hashicorp/terraform:1.5 # Use terraform image
+          script:
+            - cd training # Navigate to the terraform directory
+            - terraform init -backend=false # Don't need backend for validate
+            - terraform validate
+            - terraform fmt -check # Check formatting
+
+  # CD Pipeline: Triggered manually or on merge to main (example: manual)
+  custom:
+    deploy-and-test-ad-training:
+      - step:
+          <<: *ci-checks # Re-run checks just in case
+          name: Deploy/Test - CI Checks
+      - step:
+          <<: *build-push-container
+          name: Deploy/Test - Build & Push Container
+      - step:
+          name: Deploy Infrastructure and Run Integration Tests
+          deployment: test # Specify environment (maps to Bitbucket deployment variables)
+          trigger: manual # Make it a manual step
+          image: python:3.9 # Base image, needs terraform and aws cli
+          caches:
+            - pip
+            - terraform # Cache terraform plugins
+          script:
+            # Install dependencies
+            - apt-get update && apt-get install -y unzip --no-install-recommends
+            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip # Get specific TF version
+            - unzip terraform.zip && mv terraform /usr/local/bin/
+            - rm terraform.zip
+            - pip install -r requirements-dev.txt # pytest, boto3 etc.
+
+            # Configure AWS Credentials (uses Bitbucket deployment variables)
+            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION # e.g., eu-central-1
+
+            # Deploy/Update Infrastructure
+            - cd training
+            - terraform init # Use default backend configured in TF files (e.g., S3)
+            - terraform plan -out=tfplan # Optional plan review
+            # Automatically pass the image URI built in the previous step
+            # Need to get the full ECR URI correctly constructed
+            - export TF_VAR_training_image_uri="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME}:${BITBUCKET_COMMIT}"
+            # Also pass necessary input variables for TF apply (e.g., bucket names if not using data sources)
+            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
+            - export TF_VAR_glue_catalog_db_name=$DEPLOY_GLUE_CATALOG_DB_NAME
+            - terraform apply -auto-approve # Add input=false if plan needs approval
+
+            # Set environment variables for integration tests (using DEPLOY_ vars from Bitbucket)
+            - export TEST_AD_TRAINING_SFN_ARN=$(terraform output -raw ad_training_state_machine_arn) # Get ARN from output
+            - export TEST_AD_MODEL_PKG_GROUP=$DEPLOY_AD_MODEL_PKG_GROUP # Set from BB variable
+            - export TEST_AD_FEATURE_GROUP=$DEPLOY_AD_FEATURE_GROUP # Set from BB variable
+            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TEST_TRAINING_IMAGE_URI=$TF_VAR_training_image_uri # Reuse the var set for terraform
+
+            # Prepare Test Data (Placeholder - requires action)
+            - echo "INFO: Ensuring integration test data is available in S3..."
+            # Add commands here to trigger the ingestion job for test data OR verify pre-staged data
+            # Example: aws glue start-job-run --job-name <ingestion-job-name> --arguments='{"--source_path":"s3://...", "--destination_path":"s3://..."}'
+            #          You might need to poll for job completion.
+
+            # Run Integration Tests
+            - cd .. # Go back to root to run tests
+            - echo "Running Integration Tests..."
+            - pytest tests/integration/test_training_workflow.py -v # Run integration tests
+
+definitions:
+  services:
+    docker:
+      memory: 3072 # Increase memory for Docker if needed
+  caches:
+    terraform: $HOME/.terraform.d/plugin-cache # Cache Terraform plugins
