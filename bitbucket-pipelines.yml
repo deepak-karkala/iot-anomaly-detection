@@ -1,118 +1,215 @@
-image: python:3.9 # Base image for most steps
+image: python:3.9 # Base image suitable for python tests, linting
 
-pipelines:
-  # CI Pipeline: Runs on pushes to feature branches or Pull Requests to develop/main
-  branches:
-    'feature/*': # Or use pull-requests section
-      - step: &ci-checks
-          name: Lint and Unit Test
-          caches:
-            - pip
-          script:
-            - pip install -r requirements-dev.txt # flake8, pytest, pyspark, sklearn, etc.
-            - echo "Running Linter..."
-            - flake8 scripts/ tests/
-            - echo "Running Unit Tests..."
-            - pytest tests/unit/ # Assuming unit tests are here
-          artifacts:
-            - tests/** # Keep test reports if needed
-
-      - step: &build-push-container
-          name: Build and Push Training Container
-          services:
-            - docker # Enable Docker service
-          caches:
-            - docker
-          script:
-            # Environment variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME must be configured in Bitbucket Repository variables
-            - echo "Building Docker image..."
-            - > # Multiline script command
-              docker build -t $ECR_REPOSITORY_NAME:$BITBUCKET_COMMIT scripts/train/ \
-              --build-arg YOUR_BUILD_ARGS_IF_ANY # Pass build args if needed
-            - echo "Logging into AWS ECR..."
-            # Use AWS Pipe for ECR login (recommended) or aws cli
-            - pipe: amazon/aws-ecr-push-image:1.6.1
-              variables:
-                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
-                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
-                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
-                IMAGE_NAME: $ECR_REPOSITORY_NAME
-                TAGS: $BITBUCKET_COMMIT latest # Push commit hash and latest tags
-                # EXTRA_ARGS: "--debug" # Optional
-
-      - step: &validate-infra
-          name: Validate Infrastructure Code
-          image: hashicorp/terraform:1.5 # Use terraform image
-          script:
-            - cd training # Navigate to the terraform directory
-            - terraform init -backend=false # Don't need backend for validate
-            - terraform validate
-            - terraform fmt -check # Check formatting
-
-  # CD Pipeline: Triggered manually or on merge to main (example: manual)
-  custom:
-    deploy-and-test-ad-training:
-      - step:
-          <<: *ci-checks # Re-run checks just in case
-          name: Deploy/Test - CI Checks
-      - step:
-          <<: *build-push-container
-          name: Deploy/Test - Build & Push Container
-      - step:
-          name: Deploy Infrastructure and Run Integration Tests
-          deployment: test # Specify environment (maps to Bitbucket deployment variables)
-          trigger: manual # Make it a manual step
-          image: python:3.9 # Base image, needs terraform and aws cli
-          caches:
-            - pip
-            - terraform # Cache terraform plugins
-          script:
-            # Install dependencies
-            - apt-get update && apt-get install -y unzip --no-install-recommends
-            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip # Get specific TF version
-            - unzip terraform.zip && mv terraform /usr/local/bin/
-            - rm terraform.zip
-            - pip install -r requirements-dev.txt # pytest, boto3 etc.
-
-            # Configure AWS Credentials (uses Bitbucket deployment variables)
-            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
-            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
-            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION # e.g., eu-central-1
-
-            # Deploy/Update Infrastructure
-            - cd training
-            - terraform init # Use default backend configured in TF files (e.g., S3)
-            - terraform plan -out=tfplan # Optional plan review
-            # Automatically pass the image URI built in the previous step
-            # Need to get the full ECR URI correctly constructed
-            - export TF_VAR_training_image_uri="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME}:${BITBUCKET_COMMIT}"
-            # Also pass necessary input variables for TF apply (e.g., bucket names if not using data sources)
-            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
-            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
-            - export TF_VAR_glue_catalog_db_name=$DEPLOY_GLUE_CATALOG_DB_NAME
-            - terraform apply -auto-approve # Add input=false if plan needs approval
-
-            # Set environment variables for integration tests (using DEPLOY_ vars from Bitbucket)
-            - export TEST_AD_TRAINING_SFN_ARN=$(terraform output -raw ad_training_state_machine_arn) # Get ARN from output
-            - export TEST_AD_MODEL_PKG_GROUP=$DEPLOY_AD_MODEL_PKG_GROUP # Set from BB variable
-            - export TEST_AD_FEATURE_GROUP=$DEPLOY_AD_FEATURE_GROUP # Set from BB variable
-            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
-            - export TEST_TRAINING_IMAGE_URI=$TF_VAR_training_image_uri # Reuse the var set for terraform
-
-            # Prepare Test Data (Placeholder - requires action)
-            - echo "INFO: Ensuring integration test data is available in S3..."
-            # Add commands here to trigger the ingestion job for test data OR verify pre-staged data
-            # Example: aws glue start-job-run --job-name <ingestion-job-name> --arguments='{"--source_path":"s3://...", "--destination_path":"s3://..."}'
-            #          You might need to poll for job completion.
-
-            # Run Integration Tests
-            - cd .. # Go back to root to run tests
-            - echo "Running Integration Tests..."
-            - pytest tests/integration/test_training_workflow.py -v # Run integration tests
-
+# --- Reusable Step Definitions (YAML Anchors) ---
 definitions:
   services:
     docker:
-      memory: 3072 # Increase memory for Docker if needed
+      memory: 3072
   caches:
-    terraform: $HOME/.terraform.d/plugin-cache # Cache Terraform plugins
+    pip: ~/.cache/pip
+    docker: /var/lib/docker
+    terraform: $HOME/.terraform.d/plugin-cache
+  steps:
+    - step: &lint-test
+        name: Lint and Unit Test
+        caches:
+          - pip
+        script:
+          - pip install -r requirements-dev.txt
+          - echo "Running Linter..."
+          - flake8 scripts/ tests/
+          - echo "Running Unit Tests..."
+          - pytest tests/unit/ # Run all unit tests (ingestion, training, inference)
+        artifacts:
+          - tests/pytest-report.xml # Example artifact for test results
+
+    - step: &build-push-ad-container # Renamed for clarity
+        name: Build and Push AD Training/Inference Container
+        services:
+          - docker
+        caches:
+          - docker
+        script:
+          # Required Repo Vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME_AD
+          - echo "Building AD Docker image..."
+          - >
+            docker build -t $ECR_REPOSITORY_NAME_AD:$BITBUCKET_COMMIT \
+            --file scripts/train/Dockerfile scripts/train/ # Assuming Dockerfile is here
+          - echo "Logging into AWS ECR..."
+          - pipe: amazon/aws-ecr-push-image:1.6.1
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              IMAGE_NAME: $ECR_REPOSITORY_NAME_AD # Use specific ECR repo name var
+              TAGS: $BITBUCKET_COMMIT,latest
+
+    - step: &validate-terraform
+        name: Validate Terraform Code
+        image: hashicorp/terraform:1.5
+        script:
+          - echo "Validating Ingestion Terraform..."
+          - cd ingestion && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+          - echo "Validating AD Training Terraform..."
+          - cd training_ad && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+          - echo "Validating AD Inference Terraform..."
+          - cd inference_ad && terraform init -backend=false && terraform validate && terraform fmt -check && cd ..
+
+    - step: &deploy-infra # Reusable TF Apply step
+        name: Apply Terraform
+        image: python:3.9 # Needs Terraform + AWS CLI
+        trigger: manual # Make deployment steps manual by default within CD
+        caches:
+          - pip
+          - terraform
+        script:
+          # Install TF & AWS CLI
+          - apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+          - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+          - unzip terraform.zip && mv terraform /usr/local/bin/ && rm terraform.zip
+          - pip install awscli # For potential AWS commands if needed
+
+          # Configure AWS Credentials (using DEPLOY_ vars)
+          - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+          - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+          - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION
+
+          # Apply Terraform in the specified directory (passed as env var STEP_TF_DIR)
+          - cd $STEP_TF_DIR
+          - terraform init # Assumes backend config in TF files
+          - terraform plan -out=tfplan ${TF_APPLY_VAR_ARGS} # Pass TF vars for plan/apply
+          # Optional: Add manual approval gate here in Bitbucket UI for plan
+          - terraform apply -auto-approve ${TF_APPLY_VAR_ARGS} tfplan
+
+# --- Pipeline Definitions ---
+pipelines:
+  # CI Pipeline (Feature branches or PRs)
+  branches:
+    'feature/**': # Adjust branch pattern as needed
+      - step: *lint-test
+      - step: *build-push-ad-container
+      - step: *validate-terraform
+    # Add PR pipeline if using separate triggers
+    # pull-requests:
+    #  '**':
+    #    - step: *lint-test
+    #    - step: *validate-terraform # Don't usually push container on PR
+
+  # CD / Integration Test Pipelines (Manual Triggers)
+  custom:
+    # --- Training Workflow CD ---
+    deploy-and-test-ad-training:
+      - step:
+          name: CD Training - Run Checks & Build Container
+          trigger: manual # Overall trigger for the flow
+          steps:
+            - step: *lint-test
+            - step: *build-push-ad-container
+
+      - step:
+          name: CD Training - Deploy Infra & Run Integration Tests
+          deployment: test # Use 'test' environment variables
+          image: python:3.9 # Needs python, pytest, boto3
+          caches:
+           - pip
+          script:
+            # 1. Deploy/Update Infrastructure (using reusable step's image requires installing deps again)
+            # Or reuse the deploy-infra anchor - but need to pass variables
+            - echo "Setting up environment for Terraform apply..."
+            - apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+            - unzip terraform.zip && mv terraform /usr/local/bin/ && rm terraform.zip
+            - pip install -r requirements-dev.txt # Install boto3, pytest etc.
+            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION
+            - cd training_ad
+            - terraform init
+            # Construct TF_APPLY_VAR_ARGS with -var flags needed for training_ad apply
+            - export TF_VAR_training_image_uri="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME_AD}:${BITBUCKET_COMMIT}" # Use DEPLOY vars
+            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
+            - export TF_VAR_glue_catalog_db_name=$DEPLOY_GLUE_CATALOG_DB_NAME
+            - terraform apply -auto-approve # Add -var flags if not using TF_VAR_ prefix
+
+            # 2. Set Environment Variables for Integration Test
+            - export TEST_AD_TRAINING_SFN_ARN=$(terraform output -raw ad_training_state_machine_arn)
+            - export TEST_AD_MODEL_PKG_GROUP=$DEPLOY_AD_MODEL_PKG_GROUP
+            - export TEST_AD_FEATURE_GROUP=$DEPLOY_AD_FEATURE_GROUP
+            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TEST_TRAINING_IMAGE_URI=$TF_VAR_training_image_uri
+            - export BITBUCKET_COMMIT=$BITBUCKET_COMMIT # Ensure commit hash is available
+
+            # 3. Prepare Test Data (Placeholder - NEEDS IMPLEMENTATION)
+            - echo "INFO: Ensuring training integration test data is available..."
+            # Add AWS CLI or script call here to trigger ingestion job or check data
+
+            # 4. Run Training Integration Tests
+            - cd ../ # Back to root
+            - echo "Running Training Integration Tests..."
+            - pytest tests/integration/test_ad_training_workflow.py -v --junitxml=tests/training-integration-report.xml
+
+          artifacts: # Save test results
+            - tests/training-integration-report.xml
+
+    # --- Inference Workflow CD ---
+    deploy-and-test-ad-inference:
+      - step: # Optional: Re-run checks/build if inference CD is independent
+          name: CD Inference - Run Checks & Build Container (Optional)
+          trigger: manual
+          steps:
+            - step: *lint-test
+            # - step: *build-push-ad-container # Only if code changed since last build relevant to inference
+
+      - step:
+          name: CD Inference - Deploy Infra & Run Integration Tests
+          deployment: test
+          trigger: manual
+          image: python:3.9
+          caches:
+            - pip
+            - terraform
+          script:
+            # 1. Install Deps & Configure AWS
+            - apt-get update && apt-get install -y unzip && rm -rf /var/lib/apt/lists/*
+            - curl -o terraform.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+            - unzip terraform.zip && mv terraform /usr/local/bin/ && rm terraform.zip
+            - pip install -r requirements-dev.txt
+            - export AWS_ACCESS_KEY_ID=$DEPLOY_AWS_ACCESS_KEY_ID
+            - export AWS_SECRET_ACCESS_KEY=$DEPLOY_AWS_SECRET_ACCESS_KEY
+            - export AWS_DEFAULT_REGION=$DEPLOY_AWS_DEFAULT_REGION
+
+            # 2. Deploy/Update Inference Infrastructure
+            - cd inference_ad
+            - terraform init
+            # Construct TF_APPLY_VAR_ARGS for inference_ad apply
+            # Needs outputs from training stack or deployment variables for them
+            - export TF_VAR_processed_bucket_name=$DEPLOY_PROCESSED_BUCKET_NAME
+            - export TF_VAR_scripts_bucket_name=$DEPLOY_SCRIPTS_BUCKET_NAME
+            - export TF_VAR_ad_model_package_group_name=$DEPLOY_AD_MODEL_PKG_GROUP # Needs the PROD or relevant group name
+            - export TF_VAR_training_image_uri="${DEPLOY_AWS_ACCOUNT_ID}.dkr.ecr.${DEPLOY_AWS_DEFAULT_REGION}.amazonaws.com/${DEPLOY_ECR_REPOSITORY_NAME_AD}:latest" # Or specific commit hash if testing that
+            - export TF_VAR_sagemaker_processing_role_arn=$DEPLOY_SAGEMAKER_PROC_ROLE_ARN # Need this role ARN
+            # Example: Add more TF_VAR_ exports as needed by inference_ad/variables.tf
+            - terraform apply -auto-approve # Add -var flags if not using TF_VAR_ prefix
+
+            # 3. Set Environment Variables for Integration Test
+            - export TEST_AD_INFERENCE_SFN_ARN=$(terraform output -raw ad_inference_state_machine_arn)
+            - export TEST_ALERT_DYNAMODB_TABLE=$(terraform output -raw ad_alert_dynamodb_table_name) # Pass table name to test
+            # Pass other needed env vars like bucket names, test data paths...
+            - export TEST_PROCESSED_BUCKET=$DEPLOY_PROCESSED_BUCKET_NAME
+            # IMPORTANT: Need an APPROVED model package in the registry for this test to run!
+            # This might require a manual approval after a training CD run, or a dedicated test model package.
+
+            # 4. Prepare Test Data (Placeholder - NEEDS IMPLEMENTATION)
+            - echo "INFO: Ensuring inference integration test data (processed) is available..."
+            # Verify processed data exists for the test date range
+            - echo "INFO: Ensuring an APPROVED model package exists in $DEPLOY_AD_MODEL_PKG_GROUP..."
+            # Add check or manual prerequisite here
+
+            # 5. Run Inference Integration Tests
+            - cd .. # Back to root
+            - echo "Running Inference Integration Tests..."
+            - pytest tests/integration/test_ad_inference_workflow.py -v --junitxml=tests/inference-integration-report.xml
+
+          artifacts:
+             - tests/inference-integration-report.xml

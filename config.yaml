@@ -1,0 +1,24 @@
+feature_engineering:
+  lookback_days: 7
+  weather_feature_cols: ["hdd", "avg_temp_c"]
+
+training:
+  model_strategy: "LR_LOF"
+  hyperparameters:
+    lof_neighbors: 20
+    lof_contamination: "auto"
+  feature_columns: # List of features model actually uses
+    - daily_energy_kwh
+    - avg_temp_diff
+    # ... etc
+  instance_type: "ml.m5.large"
+
+evaluation:
+  metrics_thresholds:
+    min_f1_score: 0.6 # Example if using labels
+    max_throughput_deviation: 0.2 # Example
+  holdout_data_path: "s3://..." # Path to specific eval data
+
+inference:
+  alert_threshold: 5.0
+  batch_transform_instance_type: "ml.m5.large"
